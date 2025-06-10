@@ -1,0 +1,1112 @@
+#!/usr/bin/env python3.8
+
+'''
+Created on Sep 17, 2021
+
+@author: PLN
+'''
+
+import argparse
+from enum import Enum, auto
+import hashlib
+import lzma
+import os
+from pathlib import Path
+import pathlib
+import subprocess
+import sys
+from zipfile import ZipFile
+
+import xml.etree.ElementTree as ET
+
+# If this is a release version.
+RELEASE = True
+
+# If extra debugging print statements should be called.
+TRACE = not RELEASE
+
+# TODO: 
+# Test that fixing works, and that "re-fixing" does nothing, since everything should have been fixed last time.
+# Test that the different permutations of "-m" muting doesn't mess anything up, especially when "-f" fixing.
+# Change getSize() methods to indicate if they return string or int
+# Deploy and test on /mirror
+
+# The "new algorithm" has much easier-to-understand high-level logic.
+USE_NEW_ALGORITHM = True
+
+# Set to a negative value for unlimited.
+# Only used for debugging.
+# Should be left set to a negative number for normal production use.
+MAX_ARTIFACTS = -1
+
+# If the program is permitted to delete artifacts.xml.xz and artifacts.jar files, 
+# regardless of the options passed to the program.
+PERMIT_DELETIONS = True or RELEASE
+
+# If the program may re-sign the plugins .jar, if the MD5 or SHA256 hashes in the XML file conflicts with the
+# actual calculated hash of the .jar.
+PERMIT_JAR_RESIGNING = RELEASE
+
+# "Tags" to search for in this code, that act as "bookmarks". Their presence
+# or absence makes no difference to the operation of the program.
+TAG_OUTPUT_PER_SITE = None
+TAG_OUTPUT_TOTALS = None
+
+# Constant element property names:
+PROP_ARTIFACT_SIZE = "artifact.size"
+PROP_DOWNLOAD_SIZE = "download.size"
+PROP_DOWNLOAD_MD5 = "download.md5"
+PROP_DOWNLOAD_CHECKSUM_MD5 = "download.checksum.md5"
+PROP_DOWNLOAD_CHECKSUM_SHA256 = "download.checksum.sha-256"
+PROP_DOWNLOAD_CHECKSUM_SHA512 = "download.checksum.sha-512"
+
+# Constant special files this program deals with:
+ARTIFACTS_XML_XZ = 'artifacts.xml.xz'
+ARTIFACTS_JAR = 'artifacts.jar'
+ARTIFACTS_XML = 'artifacts.xml'
+
+# The above files, in the order they should be examined:
+ARTIFACTS_FILES = [ARTIFACTS_XML_XZ, ARTIFACTS_JAR, ARTIFACTS_XML]
+
+
+def trace(*msg):
+    if TRACE:
+        print("TRACE:", *msg)
+
+        
+def out(*msg):
+    print(*msg)
+
+    
+def outFormat(label, num):
+    out("{0:45s}{1:6d}".format(label, num))    
+
+
+class FileType(Enum):
+    XZ = auto()
+    JAR = auto()
+    XML = auto()
+
+
+def SignJar(jarPath):
+    '''Sign the .jar file passed using our certs.'''
+    if PERMIT_JAR_RESIGNING: 
+        subprocess.call(["/mirror/bin/signjar", jarPath])
+
+
+def getArtifactFile(artifact, hasProcessing):
+    file = artifact.get('id') + '_' + artifact.get('version') + '.jar'
+    if hasProcessing:
+        file += '.pack.gz'
+    return file
+
+
+def matchIfPresent(attrA, valA, attrB, valB):
+    assert not USE_NEW_ALGORITHM
+    
+    if valA is None or valB is None or valA == valB:
+        return ''
+    equals = " == "
+    not_equals = " != "
+    return attrA + equals + str(valA) + not_equals + str(valB) + equals + attrB
+
+
+def notNone(obj):
+    return obj is not None
+
+
+def numbers_match(elm_artifact, attrA, attrB , realLabel, realValue):
+    '''Returns empty string if no error, else, a human-readable description of the error.'''
+    
+    assert not USE_NEW_ALGORITHM
+   
+    errorMsg = ''
+    aNeedsFixing = False
+    bNeedsFixing = False
+    
+    '''The following code tests for equality between 3 pairs of values, and appends an error message for each pair 
+    that it finds are NOT equal:
+    * attrA and attrB
+    * attrA and real value
+    * attrB and real value
+    '''
+
+    if notNone(attrA):
+        sizeA = getArtifactProperty(elm_artifact, attrA)
+        
+        if notNone(attrB):
+            sizeB = getArtifactProperty(elm_artifact, attrB)
+            if result := matchIfPresent(attrA, sizeA, attrB, sizeB):
+                errorMsg = addLine(errorMsg, result)
+        
+        if result := matchIfPresent(attrA, sizeA, realLabel, realValue):
+            errorMsg = addLine(errorMsg, result)
+            aNeedsFixing = True
+    if notNone(attrB):
+        sizeB = getArtifactProperty(elm_artifact, attrB)
+        if result := matchIfPresent(attrB, sizeB, realLabel, realValue):
+            errorMsg = addLine(errorMsg, result)
+            bNeedsFixing = True
+
+    return errorMsg, aNeedsFixing, bNeedsFixing 
+
+
+def containsPack200Unpacker(elm_artifact):
+    elm_processing = elm_artifact.find("processing")
+    if elm_processing is None:
+        return False
+    
+    elm_step = elm_processing.find("step")
+    if elm_step is None:
+        return False
+    
+    att_id = elm_step.attrib.get("id")
+    if att_id is None:
+        return False
+    
+    return att_id == 'org.eclipse.equinox.p2.processing.Pack200Unpacker'
+
+
+def getArtifactProperty(elm_artifact, propertyName):
+    '''Returns the property value, None if the property is not found.'''
+    properties = elm_artifact.find("properties")
+    for property in properties:
+        name = property.attrib["name"]
+        if not RELEASE:
+            assert name != None
+        if name == propertyName:
+            return property.attrib["value"]
+    return None
+
+
+def setArtifactProperty(elm_artifact, propertyName, propertyValue):
+    if FIX:
+        properties = elm_artifact.find("properties")
+        for property in properties:
+            name = property.attrib["name"]
+            if name == propertyName:
+                property.attrib["value"] = propertyValue
+                global totalFixes
+                totalFixes += 1
+                break
+
+
+def getArtifactPath(pathArtifactsXml, elm_artifact):
+    '''Returns the .jar or .gz file from the plugins directory.'''
+    path = Path(pathArtifactsXml)
+    path = path.parent
+    path = path.joinpath("plugins", getArtifactFile(elm_artifact, containsPack200Unpacker(elm_artifact)))
+    assert type(path) is pathlib.PosixPath, type(path)
+    assert str(path).endswith(".gz") or str(path).endswith(".jar"), str(path)
+    return path
+
+
+def getSize(pathToFile):
+    size = os.path.getsize(pathToFile)
+    assert type(size) is int, type(size)
+    return size
+
+
+def hash(alg, fname):
+    with open(fname, "rb") as f:
+        for chunk in iter(lambda: f.read(4096), b""):
+            alg.update(chunk)
+    return alg.hexdigest()
+
+
+def md5(fname):
+    return hash(hashlib.md5(), fname)
+
+
+def sha256(fname):
+    return hash(hashlib.sha256(), fname)
+
+def sha512(fname):
+    return hash(hashlib.sha512(), fname)
+
+def size_matches(artifact, fileSize):
+    '''Returns 3 values.'''
+    return numbers_match(artifact, PROP_ARTIFACT_SIZE, PROP_DOWNLOAD_SIZE, "file size", fileSize)
+
+
+def md5_matches(elm_artifact, md5_value):
+    '''Returns 3 values.'''
+    return numbers_match(elm_artifact, PROP_DOWNLOAD_MD5, PROP_DOWNLOAD_CHECKSUM_MD5, "md5 checksum", md5_value)
+
+
+def sha256_matches(elm_artifact, sha256_value):
+    '''Returns 3 values.'''
+    return numbers_match(elm_artifact, PROP_DOWNLOAD_CHECKSUM_SHA256, None, "sha256 checksum", sha256_value)  
+
+def sha512_matches(elm_artifact, sha512_value):
+    '''Returns 3 values.'''
+    return numbers_match(elm_artifact, PROP_DOWNLOAD_CHECKSUM_SHA512, None, "sha512 checksum", sha512_value)   
+
+
+class PluginsJar:
+    '''Represents the logical interaction with a .jar file in the plugins directory.'''
+    
+    def __init__(self, pathToJar=None):
+        if pathToJar is not None:
+            self.parse(pathToJar)
+    
+    def parse(self, pathToJar):
+        self.pathToJar = pathToJar
+        
+        self.size = getSize(pathToJar)
+        assert self.size, self.size
+        
+        self.MD5 = md5(pathToJar)
+        assert self.MD5, self.MD5 
+        
+        self.SHA256 = sha256(pathToJar)
+        assert self.SHA256, self.SHA256
+        
+        self.SHA512 = sha512(pathToJar)
+        assert self.SHA512, self.SHA512
+    
+    def reparse(self):
+        '''Reparses the .jar file previously parsed.'''
+        self.parse(self.pathToJar)
+        
+    def getSize(self):
+        '''The actual size of the .jar file.'''
+        assert type(self.size) is int, type(self.size)
+        return self.size
+    
+    def getMD5(self):
+        '''The actual MD5 of the .jar file.'''
+        return self.MD5
+    
+    def getSHA256(self):
+        '''The actual SHA256 of the .jar file.'''
+        return self.SHA256
+    
+    def getSHA512(self):
+        '''The actual SHA512 of the .jar file.'''
+        return self.SHA512
+
+    def sign(self):
+        '''Both signs AND re-parses the .jar file.'''
+        SignJar(self.pathToJar)
+        self.reparse()
+
+    def sizeConflicts(self, artifactElm):
+        '''True if the actual .jar file size conflicts with either of the existing XML properties. False if no conflict is detected.'''
+        assert type(artifactElm) is ArtifactElm, type(artifactElm)
+        
+        isConflict = False
+        
+        self.lastArtifactSize = int(artifactElm.getArtifactSize())
+        if self.lastArtifactSize is not None  and self.lastArtifactSize != -1 and self.lastArtifactSize != self.getSize():
+            isConflict = True
+        
+        self.lastDownloadSize = int(artifactElm.getDownloadSize())
+        if self.lastDownloadSize is not None and self.lastDownloadSize != self.getSize():
+            isConflict = True
+        
+        return isConflict
+
+    def md5Conflicts(self, artifactElm):
+        '''True if the actual .jar hashes conflict with either of the existing XML properties. False if no conflict is detected.'''        
+        assert type(artifactElm) is ArtifactElm, type(artifactElm)
+
+        isConflict = False
+
+        self.lastDownloadMD5 = artifactElm.getDownloadMD5()
+        if self.lastDownloadMD5 is not None and self.lastDownloadMD5 != self.getMD5():
+            isConflict = True
+
+        self.lastDownloadChecksumMD5 = artifactElm.getDownloadChecksumMD5()
+        if self.lastDownloadChecksumMD5 is not None and self.lastDownloadChecksumMD5 != self.getMD5():
+            isConflict = True
+
+        return isConflict
+
+    def sha256Conflicts(self, artifactElm):
+        '''True if the actual .jar hash conflicts with the existing XML property. False if no conflict is detected.'''        
+        assert type(artifactElm) is ArtifactElm, type(artifactElm)
+
+        isConflict = False
+
+        self.lastDownloadChecksumSHA256 = artifactElm.getDownloadChecksumSHA256()
+        if self.lastDownloadChecksumSHA256 is not None and self.lastDownloadChecksumSHA256 != self.getSHA256():
+            isConflict = True
+
+        return isConflict
+    
+    def sha512Conflicts(self, artifactElm):
+        '''True if the actual .jar hash conflicts with the existing XML property. False if no conflict is detected.'''        
+        assert type(artifactElm) is ArtifactElm, type(artifactElm)
+
+        isConflict = False
+
+        self.lastDownloadChecksumSHA512 = artifactElm.getDownloadChecksumSHA512()
+        if self.lastDownloadChecksumSHA512 is not None and self.lastDownloadChecksumSHA512 != self.getSHA512():
+            isConflict = True
+
+        return isConflict
+
+
+class ArtifactElm:
+    '''Represents the logical interaction with an artifact element in the artifacts.xml file. 
+    Parses the element, extracting the 5 pertinent property values, if those properties exist, otherwise setting None, which indicates
+    that the property does not exist. The 'set' methods conditionally allow setting those property values, but only if the property already exists.'''
+    
+    def __init__(self, elmArtifact=None):
+        if elmArtifact is not None:
+            self.parse(elmArtifact)
+    
+    def parse(self, elmArtifact):
+        self.elmArtifact = elmArtifact
+        self.artifactSize = getArtifactProperty(elmArtifact, PROP_ARTIFACT_SIZE)
+        self.downloadSize = getArtifactProperty(elmArtifact, PROP_DOWNLOAD_SIZE)
+        self.downloadMD5 = getArtifactProperty(elmArtifact, PROP_DOWNLOAD_MD5)
+        self.downloadChecksumMD5 = getArtifactProperty(elmArtifact, PROP_DOWNLOAD_CHECKSUM_MD5)
+        self.downloadChecksumSHA256 = getArtifactProperty(elmArtifact, PROP_DOWNLOAD_CHECKSUM_SHA256)
+        self.downloadChecksumSHA512 = getArtifactProperty(elmArtifact, PROP_DOWNLOAD_CHECKSUM_SHA512)
+        
+    def setFromPluginsJar(self, pluginsJar):
+        self.setSize(pluginsJar.getSize())
+        self.setMD5(pluginsJar.getMD5())
+        self.setSHA256(pluginsJar.getSHA256())
+        self.setSHA512(pluginsJar.getSHA512())
+        
+        # Having set the artifact element in the XML file, we need to re-parse that element, so that
+        # our member variables are in sync with it.
+        self.parse(self.elmArtifact)
+    
+    def setSize(self, size):
+        '''Returns number of properties set.'''
+        assert type(size) is int, type(size)
+        count = 0
+        if self.setArtifactSize(size):
+            count += 1
+        if self.setDownloadSize(size):
+            count += 1
+        return count
+        
+    def setMD5(self, md5):
+        '''Returns number of properties set.'''
+        assert type(md5) is str, type(md5)
+        count = 0
+        if self.setDownloadMD5(md5):
+            count += 1
+        if self.setDownloadChecksumMD5(md5):
+            count += 1
+        return count
+        
+    def setSHA256(self, sha256):
+        '''Returns number of properties set.'''
+        assert type(sha256) is str, type(sha256)        
+        count = 0
+        if self.setDownloadChecksumSHA256(sha256):
+            count += 1
+        return count
+    
+    def setSHA512(self, sha512):
+        '''Returns number of properties set.'''
+        assert type(sha512) is str, type(sha512)        
+        count = 0
+        if self.setDownloadChecksumSHA512(sha512):
+            count += 1
+        return count
+    
+    def getArtifactSize(self):
+        try:
+            assert type(self.artifactSize) is str, type(self.artifactSize)
+            return self.artifactSize
+        except AssertionError as msg:
+            print("XML artifact size missing")
+            return -1
+    
+    def setArtifactSize(self, value):
+        '''Warning: if the value is an int, rather than a string, then it must be converted to a string, thus the call to str().''' 
+        if self.artifactSize:
+            setArtifactProperty(self.elmArtifact, PROP_ARTIFACT_SIZE, str(value))
+            return True 
+        return False
+    
+    def getDownloadSize(self):
+        assert type(self.downloadSize) is str, type(self.downloadSize)
+        return self.downloadSize
+    
+    def setDownloadSize(self, value):
+        '''Warning: if the value is an int, rather than a string, then it must be converted to a string, thus the call to str().'''        
+        if self.downloadSize:
+            setArtifactProperty(self.elmArtifact, PROP_DOWNLOAD_SIZE, str(value))
+            return True 
+        return False
+    
+    def getDownloadMD5(self):
+        return self.downloadMD5
+    
+    def setDownloadMD5(self, value):
+        if self.downloadMD5:
+            setArtifactProperty(self.elmArtifact, PROP_DOWNLOAD_MD5, value)
+            return True 
+        return False
+    
+    def getDownloadChecksumMD5(self):
+        return self.downloadChecksumMD5
+    
+    def setDownloadChecksumMD5(self, value):
+        if self.downloadChecksumMD5:
+            setArtifactProperty(self.elmArtifact, PROP_DOWNLOAD_CHECKSUM_MD5, value)
+            return True 
+        return False
+    
+    def getDownloadChecksumSHA256(self):
+        return self.downloadChecksumSHA256
+
+    def setDownloadChecksumSHA256(self, value):
+        if self.downloadChecksumSHA256:
+            setArtifactProperty(self.elmArtifact, PROP_DOWNLOAD_CHECKSUM_SHA256, value)
+            return True 
+        return False
+    
+    def getDownloadChecksumSHA512(self):
+        return self.downloadChecksumSHA512
+
+    def setDownloadChecksumSHA512(self, value):
+        if self.downloadChecksumSHA512:
+            setArtifactProperty(self.elmArtifact, PROP_DOWNLOAD_CHECKSUM_SHA512, value)
+            return True 
+        return False
+
+
+def newAlgorithmLogic():
+    '''
+    xmlNeedsToBeUpdated=False
+    
+    read actual md and sha values from jar
+    if md or sha needs fixing:
+        re-sign jar
+        read actual md and sha values from jar
+        fix xml with both md and sha
+        xmlNeedsToBeUpdated=True
+    
+    read actual size
+    if size needs fixing:
+        fix xml size
+        xmlNeedsToBeUpdated=True
+    
+    if xmlNeedsToBeUpdated:
+        write xml to artifacts.xml
+    '''
+
+
+class ProcessArtifact:
+
+    def processArtifact(self, pathArtifactsXml, elm_artifact):
+        '''This is the main function that does everything regarding a particular "artifact" XML element, including fixing incorrect attributes,
+        as well as the .jar file in the plugins directory.'''
+        
+        assert USE_NEW_ALGORITHM
+        assert type(elm_artifact) is ET.Element, type(elm_artifact)
+
+        self.outputMsg = ''  # Empty string means there's no error.
+        self.artifactPath = getArtifactPath(pathArtifactsXml, elm_artifact)
+        self.wasMD5Fixed = False
+        self.wasSHA256Fixed = False
+        self.wasSHA512Fixed = False
+        self.wasSizeFixed = False
+        self.wasJarResigned = False
+        self.xmlNeedsToBeUpdated = False  # Note: Not returned from method, as the others are        
+            
+        if not os.path.exists(self.artifactPath):
+            outputMsg = "File not found: " + str(self.artifactPath)
+        else:
+            artifactElm = ArtifactElm(elm_artifact)  # Represents the artifact element in the XML
+            pluginsJar = PluginsJar(self.artifactPath)  # Represents the .jar in the plugins directory
+            
+            if CHECK_MD5 and pluginsJar.md5Conflicts(artifactElm):
+                self.outputMsg = addLine(self.outputMsg, ".jar actual MD5 hash=" + pluginsJar.getMD5() if pluginsJar.lastDownloadMD5 else "NONE" + 
+                                         ", XML download MD5=" + pluginsJar.lastDownloadMD5 + 
+                                         ", XML download checksum MD5=" + pluginsJar.lastDownloadChecksumMD5)                
+                self.wasMD5Fixed = True
+                if FIX:
+                    self.wasJarResigned = True  # Actually flagging if jar NEEDS to be re-signed.
+
+            if CHECK_SHA256 and pluginsJar.sha256Conflicts(artifactElm):
+                self.outputMsg = addLine(self.outputMsg, ".jar actual SHA256 hash=" + pluginsJar.getSHA256() + 
+                                         ", xml download checksum SHA256=" + pluginsJar.lastDownloadChecksumSHA256)
+                self.wasSHA256Fixed = True
+                if FIX:
+                    self.wasJarResigned = True  # Actually flagging if jar NEEDS to be re-signed.
+                    
+            if CHECK_SHA512 and pluginsJar.sha512Conflicts(artifactElm):
+                self.outputMsg = addLine(self.outputMsg, ".jar actual SHA512 hash=" + pluginsJar.getSHA512() + 
+                                         ", xml download checksum SHA512=" + pluginsJar.lastDownloadChecksumSHA512)
+                self.wasSHA512Fixed = True
+                if FIX:
+                    self.wasJarResigned = True  # Actually flagging if jar NEEDS to be re-signed.
+                
+            if self.wasJarResigned:
+                self.outputMsg = addLine(self.outputMsg, ".jar was re-signed")
+                pluginsJar.sign()    
+                self.xmlNeedsToBeUpdated = True
+                
+            if CHECK_SIZE and pluginsJar.sizeConflicts(artifactElm):
+                self.outputMsg = addLine(self.outputMsg,
+                    ".jar actual size=" + str(pluginsJar.getSize()) + 
+                    ", XML artifact size=" + str(pluginsJar.lastArtifactSize) + 
+                    ", XML download size=" + str(pluginsJar.lastDownloadSize))
+                self.wasSizeFixed = True
+                self.xmlNeedsToBeUpdated = True
+    
+            if self.xmlNeedsToBeUpdated:
+                artifactElm.setFromPluginsJar(pluginsJar)
+    
+        # This line should be eventually removed, and the client code accessing these via the object reference.        
+        return self.artifactPath, self.outputMsg, self.wasJarResigned, self.wasMD5Fixed, self.wasSHA256Fixed, self.wasSHA512Fixed, self.wasSizeFixed
+
+
+# The ProcessArtifact class above replaces this method.
+def processArtifact(pathArtifactsXml, elm_artifact):
+    '''This is the main function that does everything regarding a particular "artifact" XML element, including fixing incorrect attributes.'''
+    
+    assert not USE_NEW_ALGORITHM
+    
+    assert type(elm_artifact) is ET.Element, type(elm_artifact)
+    outputMsg = ''  # Empty string means there's no error.
+    artifactPath = getArtifactPath(pathArtifactsXml, elm_artifact)
+    fileExists = os.path.exists(artifactPath)
+    
+    wasMD5Fixed = False
+    wasSHA256Fixed = False
+    wasSHA512Fixed = False
+    wasSizeFixed = False
+    wasJarResigned = False    
+    if not fileExists:
+        outputMsg = "File not found: " + artifactPath
+    else:
+        if CHECK_MD5:
+            actualMd5 = str(md5(artifactPath))
+            errMsg, downloadMd5NeedsFixing, downloadChecksumMd5NeedsFixing = md5_matches(elm_artifact, actualMd5)
+            if errMsg:
+                outputMsg = addLine(outputMsg, errMsg)
+                SignJar(artifactPath)
+                wasJarResigned = True
+                actualMd5 = str(md5(artifactPath))
+                if downloadMd5NeedsFixing:
+                    setArtifactProperty(elm_artifact, PROP_DOWNLOAD_MD5, actualMd5)
+                    wasMD5Fixed = True
+                if downloadChecksumMd5NeedsFixing:
+                    setArtifactProperty(elm_artifact, PROP_DOWNLOAD_CHECKSUM_MD5, actualMd5)
+                    wasMD5Fixed = True    
+
+        if CHECK_SHA256: 
+            actualSha256 = str(sha256(artifactPath))
+            errMsg, downloadChecksumSha256NeedsFixing, bNeedsFixing = sha256_matches(elm_artifact, actualSha256)
+            if errMsg:
+                outputMsg = addLine(outputMsg, errMsg)
+                SignJar(artifactPath)
+                wasJarResigned = True
+                actualSha256 = str(sha256(artifactPath))
+                if downloadChecksumSha256NeedsFixing:
+                    setArtifactProperty(elm_artifact, PROP_DOWNLOAD_CHECKSUM_SHA256, actualSha256)
+                    wasSHA256Fixed = True
+                assert not bNeedsFixing
+               
+        if CHECK_SHA512: 
+            actualSha512 = str(sha512(artifactPath))
+            errMsg, downloadChecksumSha512NeedsFixing, bNeedsFixing = sha512_matches(elm_artifact, actualSha512)
+            if errMsg:
+                outputMsg = addLine(outputMsg, errMsg)
+                SignJar(artifactPath)
+                wasJarResigned = True
+                actualSha512 = str(sha512(artifactPath))
+                if downloadChecksumSha512NeedsFixing:
+                    setArtifactProperty(elm_artifact, PROP_DOWNLOAD_CHECKSUM_SHA512, actualSha512)
+                    wasSHA512Fixed = True
+                assert not bNeedsFixing
+                      
+        if CHECK_SIZE:
+            actualSize = str(getSize(artifactPath))
+            errMsg, artifactSizeNeedsFixing, downloadSizeNeedsFixing = size_matches(elm_artifact, actualSize)
+            if errMsg:
+                outputMsg = addLine(outputMsg, errMsg)
+                if artifactSizeNeedsFixing:
+                    setArtifactProperty(elm_artifact, PROP_ARTIFACT_SIZE, actualSize)
+                    wasSizeFixed = True
+                if downloadSizeNeedsFixing:
+                    setArtifactProperty(elm_artifact, PROP_DOWNLOAD_SIZE, actualSize)
+                    wasSizeFixed = True    
+            
+    return artifactPath, outputMsg, wasJarResigned, wasMD5Fixed, wasSHA256Fixed, wasSHA512Fixed, wasSizeFixed
+
+
+def getOsgiArtifacts(pathArtifactsXml):
+    '''Returns a list of the 'artifact' elements that have a 'classifier' attribute of 'osgi.bundle'.'''
+    elementTree = ET.parse(pathArtifactsXml)
+    elm_repository = elementTree.getroot()
+    artifacts = []
+    for elm_repository_child in elm_repository:
+        if elm_repository_child.tag == 'artifacts':
+            elm_artifacts = elm_repository_child
+            for elm_artifact in elm_artifacts:
+                attr_classifier = elm_artifact.attrib.get('classifier');
+                if attr_classifier == 'osgi.bundle':
+                    artifacts.append(elm_artifact)
+    return artifacts, elementTree
+
+
+class ArtifactsXmlFileProcessor:
+    '''An object of this class contains the results from calling the sole method.''' 
+    
+    def __init__(self):
+        self.numSuccesses = 0  # Number of "successful" artifacts elements
+        self.numProblems = 0  # Number of artifacts elements having a "problem" (i.e., non-equal values that should be equal)
+        self.wasFixed = False  # If any fixes were made 
+
+    def processLogicalArtifactsXml(self, pathArtifactsXml, fileType):
+        '''The artifact XML file passed is either an xml file generated from an .xz or .jar file, or
+        an original .xml file.'''
+        
+        # Here we get all the 'artifacts' elements:
+        osgiArtifacts, elementTree = getOsgiArtifacts(pathArtifactsXml)
+        
+        self.__init__()
+        countLoop = 0
+        
+        # For each artifact element in the "logical" XML file:
+        for elm_artifact in osgiArtifacts:
+            countLoop += 1
+            
+            # This is just to enable easier debugging:
+            if MAX_ARTIFACTS >= 0 and countLoop > MAX_ARTIFACTS:
+                break
+            
+            if USE_NEW_ALGORITHM:
+                pa = ProcessArtifact()
+                artifactPath, outputMsg , wasJarResigned, wasMD5Fixed, wasSHA256Fixed, wasSHA512Fixed, wasSizeFixed = pa.processArtifact(pathArtifactsXml, elm_artifact)
+            else:
+                artifactPath, outputMsg , wasJarResigned, wasMD5Fixed, wasSHA256Fixed, wasSHA512Fixed, wasSizeFixed = processArtifact(pathArtifactsXml, elm_artifact)
+            
+            if outputMsg:
+                self.numProblems += 1
+                if not MUTE_DETAILS:
+                    TAG_OUTPUT_PER_SITE                    
+                    out(str(self.numProblems) + ")", artifactPath)
+                    if not USE_NEW_ALGORITHM:
+                        if(wasSizeFixed):
+                            out("Size was fixed")
+                        if(wasMD5Fixed):
+                            out("MD5 was fixed")
+                        if(wasSHA256Fixed):
+                            out("SHA256 was fixed")
+                        if(wasSHA512Fixed):
+                            out("SHA512 was fixed")
+                        if wasJarResigned:
+                            out("File was re-signed")
+                    out(outputMsg)
+                    out()
+            else:
+                self.numSuccesses += 1
+                
+        if FIX and self.numProblems > 0:
+            try:
+                elementTree.write(pathArtifactsXml, encoding="unicode")
+            except Exception as e:
+                print("PROBLEM:", e)
+                raise e
+                
+            self.wasFixed = True
+    
+        # Site results:
+        s = pathArtifactsXml
+
+        if fileType == FileType.XZ:
+            s += " (from .xz)"
+        elif fileType == FileType.JAR:
+            s += " (from .jar)"
+        TAG_OUTPUT_PER_SITE            
+        out(s)  # Prints the path to the logical artifacts.xml file parsed.
+
+    def getNumSuccesses(self):
+        return self.numSuccesses
+    
+    def getNumProblems(self):
+        return self.numProblems
+    
+    def getWasFixed(self):
+        return self.wasFixed
+
+
+def main_original():
+    assignArgs()
+    pathArtifactsXml = PATH.joinpath("artifacts.xml")
+    p = ArtifactsXmlFileProcessor()
+    p.processLogicalArtifactsXml(pathArtifactsXml, FileType.XML)
+    return p.getNumProblems()
+
+
+def main_walk_down():
+    assignArgs()
+    
+    TAG_OUTPUT_TOTALS    
+    totalProblems, totalDeletedXzs, totalDeletedJars, totalSitesFixed, totalFixes, totalSuccesses = walkDir(PATH, [ARTIFACTS_XML_XZ, ARTIFACTS_JAR, ARTIFACTS_XML])
+    
+    outFormat("Total successful artifacts elements:", totalSuccesses)
+    outFormat("Total problem artifacts elements:", totalProblems)
+    if FIX:
+        outFormat("Total deleted .xz files:", totalDeletedXzs)
+        outFormat("Total deleted .jar files:", totalDeletedJars)
+        outFormat("Total number of fixes:", totalFixes)    
+        outFormat("Total number of sites fixed:", totalSitesFixed)   
+    return totalProblems  # Exit code returned to the OS.
+
+
+def main():
+    out(sys.argv[0], "is running...\n")
+
+    if True:
+        totalProblems = main_walk_down()
+    else:
+        totalProblems = main_original()
+        outFormat("Total problems:", totalProblems)        
+
+    return totalProblems
+
+
+def getArgs():
+    '''Newer means of getting arguments, now that switches are being added.'''
+    argParser = argparse.ArgumentParser(description="Update Site Validator")
+    argParser.add_argument('dirs', nargs=1, help='path to an update site directory')
+    argParser.add_argument('--ignore_size', action="store_true", default=False, help="ignore 'size' attributes in artifacts.xml")
+    argParser.add_argument('--ignore_md5', action="store_true", default=False, help="ignore 'md5' attributes in artifacts.xml")
+    argParser.add_argument('--ignore_sha256', action="store_true", default=False, help="ignore 'sha256' attributes in artifacts.xml")
+    argParser.add_argument('--ignore_sha512', action="store_true", default=False, help="ignore 'sha2512' attributes in artifacts.xml")
+    argParser.add_argument('-m', '--mute_details', action="store_true", default=False, help="do not display individual errors")
+    argParser.add_argument('-f', '--fix', action="store_true", default=False, help="fix incorrect XML attributes and re-sign .jars in the plugins directory as necessary")
+    return argParser.parse_args()
+
+
+def assignArgs():
+    '''Parses command-line arguments, and assigns them to global variables.'''
+    global PATH, CHECK_SIZE, CHECK_MD5, CHECK_SHA256, CHECK_SHA512, MUTE_DETAILS, FIX
+    args = getArgs()
+    PATH = Path(args.dirs[0])
+    CHECK_SIZE = not args.ignore_size
+    CHECK_MD5 = not args.ignore_md5
+    CHECK_SHA256 = not args.ignore_sha256
+    CHECK_SHA512 = not args.ignore_sha512
+    MUTE_DETAILS = args.mute_details
+    FIX = args.fix
+
+
+def testGetArgs():
+    args = getArgs()
+    out("dirs", args.dirs)
+    out("--ignore_size", args.ignore_size)
+    out("--ignore_md5", args.ignore_md5)
+    out("--ignoreSize_sha256", args.ignore_sha256)
+    out("--mute_details", args.mute_details)
+    out("--fix", args.fix)
+
+
+def testArgs1():
+    out(getPathToArtifactsFromArgs())
+
+
+def testPaths():
+    global TRACE
+    TRACE = True
+    a = '/a/b/c/d/file.xml'
+    trace(a)
+    trace(os.path.abspath(a))
+    
+    path = Path(a)
+    trace(str(path.parent.joinpath("myfile.txt")))
+    
+    file = "dummy.txt"
+    file2 = os.path.abspath(file)
+    trace(file2)
+
+    
+def testElementTree():
+    s = "/mirror/eclipse/releases/2021-03/202103171000/artifacts.xml"
+    s = "/home/plnahay/Documents/UpdateSiteValidatorData/202103171000/artifacts.xml"
+    
+    root = ET.parse(s).getroot();
+    # out(root)
+
+    artifacts = root.find("artifacts")
+    # out(artifacts)
+    
+    artifact_s = artifacts.findall("artifact")
+    # out(artifact_s)
+    
+    countArtifacts = 0
+    countProcessing = 0
+    countStep = 0
+    for elm_artifact in artifact_s:
+        assert type(elm_artifact) is ET.Element, type(elm_artifact)
+        countArtifacts += 1   
+        
+        if elm_processing := elm_artifact.find("processing"):
+            countProcessing += 1
+            # out("processing",elm_processing)
+            elm_step = elm_processing.find("step")
+            if elm_step is not None:
+                countStep += 1
+                out("step", elm_step)
+                # break
+        
+    out("countArtifacts", countArtifacts)
+    out("countProcessing", countProcessing)
+    out("countStep", countStep)
+
+
+def addLine(str, toAdd):
+    '''Convenience function that adds a newline only if it is necessary.'''
+    return str + "\n" + toAdd if str else toAdd
+
+
+class ArtifactsFileType:
+    
+    def __init__(self, file):
+        self.file = file
+        self.count = 0
+        self.ext = os.path.splitext(file)[1]
+    
+    def __repr__(self):
+        return self.file + " " + self.ext + " " + str(self.count)
+    
+    def increment(self):
+        self.count += 1
+
+
+def ext(file):
+    return os.path.splitext(file)[1]
+
+
+def extractXmlFromJar(pathToJarFile):
+    '''Extracts 'artifacts.xml' file from the .jar file passed.'''
+    zipFile = ZipFile(pathToJarFile)
+    zipInfo = zipFile.getinfo('artifacts.xml')
+    return zipFile.extract(zipInfo, os.path.dirname(pathToJarFile))
+
+    
+def testExtractXmlFromJar():
+    path = '/mirror/eclipse/releases/2018-12/201812191000/artifacts.jar'
+    result = extractXmlFromJar(path)
+    out(result)
+
+
+def extractXmlFromXz(pathToXzFile):
+    '''Extracts 'artifacts.xml' file from the .xz file passed.'''
+    textXml = lzma.open(pathToXzFile, 'rt').read()
+    pathToXmlFile = os.path.dirname(pathToXzFile) + "/artifacts.xml"
+    # print(pathToXmlFile)
+    with open(pathToXmlFile, 'wt') as f:
+        f.write(textXml)
+    return pathToXmlFile
+
+
+def testExtractXmlFromXz():
+    path = '/mirror/eclipse/releases/2018-12/201812191000/artifacts.xml.xz'
+    result = extractXmlFromXz(path)
+    out(result)
+
+
+def getLogicalArtifactsXml(pathToFile):
+    '''pathToFile is path to either artifacts.xml, artifacts.jar, or artifacts.xml.xz.
+    The first return value is either the argument itself, if it's already an XML file, else 
+    an appropriately-named file with XML contents, if it's a .jar or .xz.
+    We're calling this a "logical" artifacts.xml file, because the file returned, while an XML file in terms of its contents, may not
+    be the originally-named 'artifacts.xml' file, but rather, one generated by this program extracting the XML file from a .jar or .xz.
+    
+    The second return value is the enum of the file extension.'''
+    global totalXmls, totalJars, totalXzs
+    extt = ext(pathToFile)
+    if extt == '.xz':
+        totalXzs += 1
+        return extractXmlFromXz(pathToFile), FileType.XZ
+    if extt == '.jar':
+        totalJars += 1
+        return extractXmlFromJar(pathToFile), FileType.JAR
+    if extt == '.xml':
+        totalXmls += 1
+        return pathToFile, FileType.XML
+    assert False, "Bad argument that doesn't end in either .xml, .jar, or .xz: " + pathToFile
+
+
+def onFileFound(pathToFile):
+    '''The arguments is the full path to either the .xz, .jar, or .xml file found.'''
+    
+    # Get the .xml file that was either generated from a .xz or .jar file, 
+    # or was originally found as an actual artifacts.xml. It's "logical" because
+    # either it's a generated .xml file, if it was either an .xz or .jar found that was first found,
+    # OR it is the actual .xml file that was found.
+    logicalArtifactsXml, fileType = getLogicalArtifactsXml(pathToFile)
+    
+    p = ArtifactsXmlFileProcessor()
+    p.processLogicalArtifactsXml(logicalArtifactsXml, fileType)
+    return p
+
+    
+def walkDir(dirr, lookingFors):
+    '''dirr: the root directory to be walked down.
+    lookingFors: the list of files we are looking for in each directory walked down into, 
+    in the order we're looking for them.'''
+    artifactsFileTypes = []
+    for lookingFor in lookingFors:
+        artifactsFileTypes.append(ArtifactsFileType(lookingFor))
+    global totalXmls, totalJars, totalXzs, totalFixes
+    totalXmls = 0;totalJars = 0;totalXzs = 0;totalFixes = 0
+    totalProblems = 0
+    totalSuccesses = 0
+    totalDeletedXzs = 0
+    totalDeletedJars = 0
+    totalSitesFixed = 0    
+    
+    # We ignore 'dirs':
+    for (root, dirs, files) in os.walk(dirr, topdown=True):
+        break_artifactsFiles = False
+        wasFixed = False
+        for artifactsFileType in artifactsFileTypes:  # Look for .xz, .jar, .xml, in this order
+            for file in files:
+                if artifactsFileType.file == file:  # If we find one
+                    artifactsFileType.increment()
+                    
+                    # Process the .xz, .jar, or .xml first found. 'p' is the file processor object.
+                    out("Start Processing: " + root + "/" + file)
+                    p = onFileFound(root + "/" + file)
+                    wasFixed = p.getWasFixed()                    
+                    totalProblems += p.getNumProblems()
+                    totalSuccesses += p.getNumSuccesses()
+                    
+                    TAG_OUTPUT_PER_SITE                                        
+                    outFormat("Number of successful artifacts elements:", p.getNumSuccesses())
+                    outFormat("Number of problem artifacts elements:", p.getNumProblems())
+                    if p.getNumProblems() < 1:
+                        out("Site is valid.")
+                    elif wasFixed:
+                        countDeletedXzs, countDeletedJars = deleteXzAndJarFiles(root, files)
+                        outFormat("Number of deleted .xz files:", countDeletedXzs)
+                        outFormat("Number of deleted .jar files:", countDeletedJars)
+                        totalDeletedXzs += countDeletedXzs
+                        totalDeletedJars += countDeletedJars
+                        totalSitesFixed += 1
+                    out('############################################################')
+                    out()  # Print blank line.
+
+                    break_artifactsFiles = True 
+                    break
+            if break_artifactsFiles:
+                break
+            
+    trace(artifactsFileTypes)
+    trace("totalXmls", totalXmls)
+    trace("totalJars", totalJars)
+    trace("totalXzs", totalXzs)
+    trace("totalFixes", totalFixes)
+    return totalProblems, totalDeletedXzs, totalDeletedJars, totalSitesFixed, totalFixes, totalSuccesses
+
+
+def deleteXzAndJarFiles(root, files):
+    '''Parameter 'files' is files in a directory, each of which might be a .xz or .jar file.'''
+    countDeletedXzs = 0
+    countDeletedJars = 0
+    for file in files:
+        if file in [ARTIFACTS_XML_XZ, ARTIFACTS_JAR]:
+            if file == ARTIFACTS_XML_XZ:
+                countDeletedXzs += 1
+            if file == ARTIFACTS_JAR:
+                countDeletedJars += 1
+            file = root + "/" + file
+            if os.path.exists(file):
+                if PERMIT_DELETIONS:
+                    os.remove(file)
+                    trace("Deleted", file)
+                else:
+                    trace("Wanted to delete", file)
+    return countDeletedXzs, countDeletedJars
+
+
+def testWalkDir2():
+#    dir1 = '/mirror/eclipse/releases/2021-09'  
+    # [artifacts.xml=0, artifacts.xml.xz=4, artifacts.jar=4]
+    
+#    dir2 = '/mirror/eclipse/releases'  
+    # [artifacts.xml=1, artifacts.xml.xz=32, artifacts.jar=51]
+    
+#   dir3 = '/mirror/marketplace/sites'  
+    # [artifacts.xml=642, artifacts.xml.xz=0, artifacts.jar=0]
+    
+    dir4 = '/home/plnahay/Documents/UpdateSiteValidatorData/2021'
+
+    totalProblems, totalDeletedXzs, totalDeletedJars = walkDir(dir4, ARTIFACTS_FILES)
+    out("totalProblems", totalProblems)
+    out("Done")
+
+
+def testWalkDir1():
+    import os
+    lookingFors = ARTIFACTS_FILES
+    dir1 = '/mirror/eclipse/releases/2021-09'
+    dir2 = '/mirror/eclipse/releases'
+    dir3 = '/mirror/marketplace/sites'
+    dirUsed = dir3
+    count = 0;limit = 1000000;countFinds = 0
+    for (root, dirs, files) in os.walk(dirUsed, topdown=True):
+        count += 1
+        out(count, root, dirs, files)
+        break
+        for lookingFor in lookingFors:
+            for file in files:
+                if file == lookingFor:
+                    # out(count,root)
+                    out(file)
+                    countFinds += 1
+                    break
+        out('--------------------------------')
+        if count >= limit:
+            break
+    out("Finds=", countFinds)    
+    out("Done.")
+
+    
+def testFormatResults():
+    # printResults("{0:6d}","Shoe size:",13)
+    # out("\nTotal problems    : {0:6d}".format(totalProblems))
+    format = "{0:15}{1:6}"
+    outFormat("Shoe size:", 13)
+    outFormat("Street address:", 1013)
+    outFormat("01234567890123:", 1013)
+
+
+def testEnums():
+
+    class My(Enum):
+        A = 10;B = auto();C = "c"
+    
+    for e in My:
+        out(e, e.name, e.value)
+
+        
+def testSignJar():
+    file = '/home/plnahay/Documents/UpdateSiteValidatorData/2021/2021-03/202103171000/plugins/biz.aQute.bndlib_5.3.0.202102221516.jar'
+    file = '/home/plnahay/Documents/UpdateSiteValidatorData/2021/2021-03/202103171000/artifacts.jar'    
+    SignJar(file)
+    print("Done")
+
+
+if __name__ == '__main__':
+    sys.exit(main())
+#    testSignJar()
+
+#    testEnums()
+#    testFormatResults()
+#    testWalkDir1()
+#    testWalkDir2()
+#    testExtractXmlFromJar()
+#    testExtractXmlFromXz()    
+
+#   testGetArgs()
+#   testArgs()
+#   testPaths()
+#   testElementTree()
+
